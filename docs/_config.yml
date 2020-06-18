@@ -1,0 +1,13 @@
+name: "projects"
+output_dir: "docs"
+navbar:
+  title: "Projects"
+  left:
+  - text: "Home"
+   href: index.html
+  - text: "Heart Disease Prediction"
+   href: heart_disease_report_wcode.html
+output:
+  html_document:
+ theme: cosmo
+
