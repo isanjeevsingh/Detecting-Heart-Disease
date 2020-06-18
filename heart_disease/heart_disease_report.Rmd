@@ -1,0 +1,645 @@
+---
+title: "Predicting Presence of Heart Disease"
+author: "Sanjeev Singh"
+date: "6/10/2020"
+output:
+  pdf_document: default
+  html_document: default
+---
+```{r, message = FALSE, echo=FALSE}
+set.seed(23)
+```
+
+
+```{r, message = FALSE, echo=FALSE}
+## LOAD LIBRARIES
+
+library("caret")
+library("corrplot")
+library("ggplot2")
+library("pROC")
+library("PRROC")
+library("ROCR")
+library("xgboost")
+library("rjags")
+library("dplyr")
+library("coda")
+library("knitr")
+library("ggpubr")
+```
+
+```{r, message = FALSE, echo=FALSE}
+## HELPER FUNCTIONS
+
+# ROC and PRC
+calc_rocprc <- function(prob, label){
+  index_class2 <- label == 1
+  index_class1 <- label == 0
+  pr <- pr.curve(prob[index_class2], prob[index_class1], curve = TRUE)
+  roc <- roc.curve(prob[index_class2], prob[index_class1], curve = TRUE)
+  print(pr) 
+  print(roc)
+}
+
+# Function to calculate pairwise correlation [7]
+getPairCorrelation <- function(corrMatrix){
+  featureName <- colnames(corrMatrix)
+  nFeature <- length(featureName)
+  
+  # set lower triangle of matrix to NA (these values are all redundant)
+  corrMatrix[lower.tri(corrMatrix, diag = TRUE)] <- NA
+  
+  # convert matrix to data frame
+  featurePair <- data.frame(feature1 = rep(featureName, nFeature), feature2 =      rep(featureName, each = nFeature), coef = as.vector(corrMatrix))
+  # remove NAs
+  featurePair <- featurePair[!is.na(featurePair$coef), ]
+  # calculate absolute value of correlation coefficient
+  featurePair$coefAbs <- abs(featurePair$coef)
+  # order by coefficient
+  featurePair <- featurePair[order(featurePair$coefAbs, decreasing = TRUE), ]
+  
+  featurePair
+} 
+```
+
+```{r, message = FALSE, echo=FALSE}
+## LOAD DATA AND DEFINE FACTORS
+
+columns=c( "age", "sex", "angina", "resting_bp", "ser_chol", "BSgt120"
+           ,"restecg", "max_hr", "exang", "oldpeak", "slope", "vessels", "thal", "y")
+dat = read.csv(file="heart.dat", sep=" ", col.names = columns, header=FALSE)
+
+
+# Assign factors to the data
+dat$sex <- factor(dat$sex)
+levels(dat$sex) <- c("female", "male")
+
+dat$angina <- factor(dat$angina)
+levels(dat$angina)=c("typical","atypical","nonang","asymp")
+
+dat$BSgt120 <- factor(dat$BSgt120)
+levels(dat$BSgt120) <- c("false", "true")
+
+dat$restecg <- factor(dat$restecg)
+levels(dat$restecg ) <- c("normal","stt","hypertrophy")
+
+dat$exang <- factor(dat$exang)
+levels(dat$exang) <- c("no","yes")
+
+dat$slope <- factor(dat$slope, order = TRUE)
+levels(dat$slope)=c("upsloping","flat","downslop")
+
+dat$thal <- factor(dat$thal)
+levels(dat$thal)=c("normal","fixed","reversible")
+
+dat$y <- ifelse(dat$y==1, 0, 1)
+```
+
+```{r, message = FALSE, echo=FALSE, results='hide'}
+## PREPARE TRAIN AND TEST
+
+# Balanced 75% split. list = False avoids returning data as a list
+train_ind <- createDataPartition(dat$y, p = .75, list = FALSE, times = 1) 
+train.X <- dat[train_ind, ][,-ncol(dat)]
+train.y <- dat[train_ind, ]$y
+test.X  <- dat[-train_ind, ][,-ncol(dat)]
+test.y  <- dat[-train_ind, ]$y
+
+## DATA PREPROCESSING
+
+# Center data
+preProcValues <- preProcess(train.X, method = c("center", "scale"))
+train.X.T <- predict(preProcValues, train.X)
+test.X.T <- predict(preProcValues, test.X)
+
+# Fit a baseline model and extract the design matrix without the intercept column
+glm.fit = glm(train.y ~ . ,data=train.X.T, family="binomial")
+train.design.matrix = model.matrix(glm.fit)[,-1] # Get the design matrix
+test.design.matrix <- model.matrix(test.y ~ . , data=test.X.T, family="binomial")[,-1]
+```
+
+
+## Abstract
+
+Heart diseases or cardiovascular disease (CVD) are widely known, and many people suffer from it. CVD includes Angina causing chest pain, Heart Attack, Congenital Heart Disease, and several others. A few of the underlying factors that relate to heart diseases are lack of exercise, obesity, high blood cholesterol, high blood pressure, and others. Knowing that it is the leading cause of death across the world, we took this study to explore what significant factors we can relate to the presence of heart disease. Getting early signals of the presence of CVD can help save lives.
+
+In our study, we investigated several factors associated with CVD and narrowed down to critical ones that helped detect the presence of the disease. To eliminate features, we used Bayesian methodology and used Laplace Prior that makes non-essential factor effect to zero. Our final model shows that out of 18 attributes, Sex, High blood pressure in women, asymptomatic chest pain (Angina), and Irreversible Thalassemia were significant predictors of CVD. Being a simpler model with less variable, our generalized model performed better than the baseline model on the test data set with an AUC score of 86%.
+
+Keywords: CVD, Logistic Regression, Bayesian, Laplace Prior, Jags, Variable Selection
+
+## Introduction
+
+In the present problem, we are trying to narrow down on underlying factors that lead to heart disease. Since CVD constitutes a significant concern across all the countries, this project would help us know better the major factors that can cause this disease. To analyze this problem, we collected a data set available through the UCI ML repository. A major part of this project is related to variable selection; variable selection can be time-consuming if we fit many models carrying the subset of original variables. To help solve this case, we relied on Bayesian statistics, where we can use Laplace-prior to steer non-significant parameters to zero. The present study has the following components, Data: here, we discuss the details of the acquired data and explain the EDA. Next, in the Model section, we discuss data preprocessing and variable selection. In the Result and conclusion section, we discuss the model's performance and conclude on the selected variables strongly related to the response variable.
+
+
+---------------------------------------------------------------
+Attribute     Definition 
+            
+-----------   -------------------------------------------------
+age           Age of the person
+
+resting_bp    resting blood pressure (in mm Hg on admission to the hospital) 
+
+ser_chol      serum cholestoral in mg/dl
+
+max_hr        maximum heart rate achieved
+
+vessels       number of major vessels (0-3) colored by flourosopy
+
+oldpeak       ST depression induced by exercise relative to rest
+
+sex           Sex (1=Male; 0=Female)
+
+angina        Chest pain type(1=typical angina; 2=atypical 
+              angina; 3=non_anginal pain; 4=asymptomatic)
+
+BSgt120       fbs - fasting blood sugar > 120 mg/dl (1 = true; 0 = false) 
+
+restecg       resting electrocardiographic results (0 = normal; 1 = having ST-T; 
+              2 = hypertrophy)
+
+exang         exercise induced angina (1 = yes; 0 = no)
+
+thal          3 = normal; 6 = fixed defect; 7 = reversable defect 
+
+slope         the slope of the peak exercise ST segment (1 = upsloping; 2 = flat; 
+              3 = downsloping) 
+
+y             Absence (1) or presence (2) of heart disease 
+---------------------------------------------------------------
+Table: Table carrying attributes used to predict presence of CVD.
+
+
+
+```{r , echo=FALSE}
+## EXPLORATORY DATA ANALYSIS (EDA)
+
+# Distribution of classes
+bp.df=as.data.frame(round(table(dat$y, dat$sex)/sum(table(dat$y, dat$sex))*100))
+
+
+ybar <- ggplot(data=bp.df, aes(x=Var1, y=Freq, fill=Var2)) +
+          geom_bar(stat="identity", position=position_dodge()) +
+          ylim(0, 40) + ylab("percentage (%)") + xlab("class") +
+          labs(title = "A: Distribution of Response") +
+          geom_text(aes(label=Freq), vjust=1.6, color="white",
+                    position = position_dodge(0.9), size=2.5)+
+          scale_fill_brewer(palette="Paired")+ labs(fill = "sex") +
+          theme(axis.title=element_text(size=8), plot.title = element_text(size=8))
+
+# Distribution of age w.r.t. class
+acbox <- ggplot(dat, aes(x=age, y=factor(y), fill=sex)) + 
+          geom_boxplot() +  
+          labs(y = "class") + labs(x = "age") +
+          labs(title = "B: Distribution of Age") +
+          theme(axis.title=element_text(size=8), plot.title = element_text(size=8))
+
+# Distribution of age w.r.t. gender showing presence of CVD
+age1box <- ggplot(dat, aes(x=ser_chol, y=factor(y), fill=sex)) + 
+            geom_boxplot() + 
+            labs(y = "class") + labs(x = "age") +
+            labs(title = "C: Ser_chol distribution") +
+            theme(axis.title=element_text(size=8),
+                  plot.title = element_text(size=8))
+
+
+rbpbox <- ggplot(dat, aes(x=resting_bp, y=factor(y), fill=sex)) + 
+            geom_boxplot() + 
+            labs(y = "class") + labs(x = "resting bp") +
+            labs(title = "D: Resting BP Distribution") +
+            theme(axis.title=element_text(size=8), 
+                  plot.title = element_text(size=8))
+
+mhbox <- ggplot(dat, aes(x=max_hr, y=factor(y), fill=sex)) + 
+            geom_boxplot() + 
+            labs(y = "class") + labs(x = "max_hr bp") +
+            labs(title = "E: Max HR Distribution") +
+            theme(axis.title=element_text(size=8), plot.title = element_text(size=8))
+
+opbox <- ggplot(dat, aes(x=oldpeak, y=factor(y), fill=sex)) + 
+            geom_boxplot() + 
+            labs(y = "class") + labs(x = "oldpeak") +
+            labs(title = "F: Oldpeak Distribution") +
+            theme(axis.title=element_text(size=8), plot.title = element_text(size=8))
+
+#1. Correlation: Response vs. Covariates
+covariates <- names(as.data.frame(train.design.matrix)) 
+corr <- data.frame(covariate = covariates, coef = rep(NA, length(covariates)))
+for (icov in 1:length(covariates)){
+  corr$coef[icov] <- cor(train.design.matrix[, icov], train.y)
+  # print(covariates[icov]);print(corr$coef[icov])
+}
+corr.order <- corr[order(corr$coef, decreasing = FALSE), ]
+
+ycor <- ggplot(corr.order, 
+               aes(x = factor(covariate, levels = covariate), y = coef)) + 
+        geom_bar(stat = "identity", fill="steelblue") + 
+        coord_flip() + 
+        xlab("Feature") + 
+        ylab("Correlation coefficient") +
+        labs(title = "G: Correlation with Response") +
+        theme(axis.text.y = element_text(size=6), 
+                  axis.title=element_text(size=8), plot.title = element_text(size=8))
+
+#2. Pairwise correlation table
+corrMatrix <- cor(train.design.matrix)
+pairCorr <- getPairCorrelation(corrMatrix)
+pcord <- ggplot(pairCorr, aes(coef)) + geom_histogram(binwidth = 0.1, fill="steelblue") + 
+          xlab("Correlation Coefficient") +
+          labs(title = "H: Pairwise correlation distribution") +
+          theme(axis.title=element_text(size=8),plot.title = element_text(size=8))
+
+# using ggpubr to arrange all chart in one window
+
+# ggarrange(ycor, pcord, ncol = 2, nrow = 1)
+
+```
+
+## Data
+
+```{r, echo=FALSE}
+## EDA
+
+ggarrange(ybar, acbox, age1box, rbpbox, ncol = 2, nrow = 2)
+```
+
+
+For the study, we collected data from the UCI ML Repository under the name "Statlog (Heart) Data Set." There were no missing values in the data set, and it has 270 instances with 13 attributes that were ordinal, nominal, and real. We can find more details on the attributes in the above table. On encoding the nominal and ordinal variables, we landed with 18 attributes. From the above figure's section A, we found that 44% of data had the presence of CVD: indicating no major skewness in the classes, thus we can use the AUC score for model selection. 
+
+On the EDA front, we plotted several boxplots for those real variables where we can see dissimilarities w.r.t. Sex.  From above figure B, females show the presence of CVD at a higher avg. Age when compared to males. In figure D, not factoring the Sex, the average resting BP was the same for both the classes. However, on including Sex, females showed a higher average resting BP in the presence of CVD: this shows that there might be an interaction effect between these variables. 
+
+In the next chart G and H, we analyzed the correlation between predictors and the response variable. Asymptomatic angina and reversible thalassemia showed a positive correlation, whereas max heart rate and non-angina chest pain were negatively correlated with response. Later, we would see that our final selected variables showed a high correlation with the response. 
+
+Next, the pairwise correlation did not show a major correlation between two features. Most of the correlations were near zero, as shown in the picture H. A few with slightly higher correlation were mainly due to factors substituting each other. Thus, we did not see a significant problem with collinearity, which can affect the model inference. 
+
+
+
+```{r, echo=FALSE}
+## EDA
+
+ggarrange(mhbox, opbox, ycor, pcord, 
+          ncol = 2, nrow = 2)
+```
+
+
+
+```{r, message = FALSE, echo=FALSE, results='hide', warning=FALSE}
+## MODELING
+
+# 1. BASELINE MODEL
+glm.prob.train = predict(glm.fit, type="response")
+calc_rocprc(glm.prob.train, train.y) # ROC & AUC
+roc_btrain <- roc(train.y, glm.prob.train)
+glm.prob.test = predict(glm.fit, newdata=test.X.T, type="response")
+calc_rocprc(glm.prob.test, test.y) # ROC & AUC
+roc_btest <- roc(test.y, glm.prob.test)
+```
+
+
+```{r , message = FALSE, echo=FALSE, results='hide'}
+## MODELLING
+
+# 2. FIT BAYESIAN MODEL THROUGH JAGS
+
+mod_string = " model {
+    for (i in 1:length(y)) {
+        y[i] ~ dbern(p[i])
+        logit(p[i]) = int + b[1]*age[i] + b[2]*sexmale[i] + b[3]*anginaatypical[i] 
+                          + b[4]*anginanonang[i] + b[5]*anginaasymp[i] 
+                          + b[6]*resting_bp[i]       
+                          + b[7]*ser_chol[i] + b[8]*BSgt120true[i] + b[9]*restecgstt[i]
+                          + b[10]*restecghypertrophy[i] + b[11]*max_hr[i] + b[12]*exangyes[i] 
+                          + b[13]*oldpeak[i] + b[14]*slope.L[i] + b[15]*slope.Q[i]
+                          + b[16]*vessels[i] + b[17]*thalfixed[i] + b[18]*thalreversible[i]
+    }
+    
+    int ~ dnorm(0.0, 1.0/25.0)
+    for (j in 1:18) {
+        b[j] ~ ddexp(0.0, sqrt(2.0)) # has variance 1.0
+    }
+}"
+
+train.jags <- cbind(train.design.matrix , y=train.y)
+train.jags.df <- as.data.frame(train.jags)
+train.jags.list = as.list(train.jags.df)
+params = c("int", "b")
+mcmc.model = jags.model(textConnection(mod_string), data=train.jags.list, n.chains=3)
+update(mcmc.model, 1e3)
+mcmc.model.sim = coda.samples(model=mcmc.model,
+                              variable.names=params,
+                              n.iter=5e3)
+mcmc.model.csim = as.mcmc(do.call(rbind, mcmc.model.sim))
+```
+
+```{r , message = FALSE, echo=FALSE, results='hide', warning=FALSE}
+## MODELLING
+
+# Convergence diagnostics
+
+# gelman.diag(mcmc.model.sim)
+# autocorr.diag(mcmc.model.sim)
+# autocorr.plot(mcmc.model.sim)
+# effectiveSize(mcmc.model.sim)
+# HPDinterval(mcmc.model.sim)
+
+# calculate DIC
+# dic1 = dic.samples(mcmc.model, n.iter=1e3)
+# summary(mcmc.model.sim)
+
+# plot(mcmc.model.sim, ask=TRUE)
+# Remove: b1 b3 b4 b8 b9 b10 b11 b14 b17
+# age anginaatypical anginanonang BSgt120true restecgstt  restecghypertrophy max_hr slope.L thalfixed
+
+
+
+# Prediction 
+pm_coef = colMeans(mcmc.model.csim)
+# Training
+pm_Xb = pm_coef["int"] + train.design.matrix %*% pm_coef[1:18]
+phat = 1.0 / (1.0 + exp(-pm_Xb))
+calc_rocprc(phat, train.y) # ROC & AUC
+roc_lrtrain <- roc(train.y, as.matrix(phat))
+# # Test
+pm_Xb = pm_coef["int"] + test.design.matrix %*% pm_coef[1:18]
+phat = 1.0 / (1.0 + exp(-pm_Xb))
+calc_rocprc(phat, test.y) # ROC & AUC
+roc_lrtest <- roc(test.y, as.matrix(phat))
+```
+
+## Model
+
+Since the problem in hand is a binary classification task, we selected logistic regression. To start with, we split the data in the train and test set, with 75% of it in the training set. Next, we centered the training data and used its mean and variance to center the test data set. Our model selection criteria were to select one based on the AUC score on the test data set (acting as a validation set) and choosing a simpler model.
+
+To select the significant variables: First, we begin with a baseline  "GLM" model in R. The baseline model was fed with all the covariates (As shown in the figure G) to compute a baseline AUC score on the test data set. Second, we implemented logistic regression with Laplace-prior for variable selection. After creating a JAGS model with three chains, followed by a burn-in of 1e3 samples, we saved 10e3 samples per chain for further analysis. After ensuring the convergence of the respective MCMC chain, the variables were selected after observing the MCMC densplot to see if their distribution is not centered near zero. We selected the following nine variables out of the initial 18:
+
+```{r, echo=FALSE}
+## MODELLING
+
+c("sexmale", "anginaasymp", "resting_bp", "ser_chol", "exangyes", "oldpeak", "slope.Q", "vessels", "thalreversible")
+```
+
+Third, we fitted a Logistic Regression with the selected nine covariates and used a non-informative normal-prior. On analyzing the densplots, most of the variables had a posterior probability of greater than 95% for being > or < than zero. Except for one, "exangyes." We dropped it, refit the model, and calculated the respective AUC score and other metrics. 
+
+
+```{r, message = FALSE, echo=FALSE, results='hide', warning=FALSE}
+## MODELLING
+
+# Remove covariates based on the posterior estimates 
+rm_cov = c(  "age", "anginaatypical", "anginanonang", "BSgt120true"
+            ,"restecgstt",  "restecghypertrophy", "max_hr", "slope.L", "thalfixed", "exangyes")
+# FIT Reduced model
+reduced.mod.string = " model {
+    for (i in 1:length(y)) {
+        y[i] ~ dbern(p[i])
+        logit(p[i]) = int + b[1]*sexmale[i] 
+                          + b[2]*anginaasymp[i] 
+                          + b[3]*resting_bp[i]       
+                          + b[4]*ser_chol[i]
+                          + b[5]*oldpeak[i]  
+                          + b[6]*slope.Q[i]
+                          + b[7]*vessels[i] 
+                          + b[8]*thalreversible[i]
+    }
+    
+    int ~ dnorm(0.0, 1.0/25.0)
+    for (j in 1:8) {
+        b[j] ~ dnorm(0.0, 1.0/25.0) # noninformative for logistic regression
+    }
+} "
+
+params = c("int", "b")
+reduced.train.design.matrix=train.design.matrix[,!colnames(train.design.matrix) %in% rm_cov ]
+reduced.train.data  = cbind(reduced.train.design.matrix , y=train.y)
+reduced.train.jags.df <- as.data.frame(reduced.train.data)
+# reduced.train.jags.df <- reduced.train.jags.df %>%  
+#                               rename("sexmale_resting_bp"="sexmale:resting_bp") # dplyr
+reduced.train.jags.list = as.list(reduced.train.jags.df)
+reduced.mcmc.model = jags.model(textConnection(reduced.mod.string), data=reduced.train.jags.list, n.chains=3)
+update(reduced.mcmc.model, 1e3)
+reduced.mcmc.model.sim = coda.samples(model=reduced.mcmc.model,
+                                      variable.names=params,
+                                      n.iter=25e3)
+reduced.mcmc.model.csim = as.mcmc(do.call(rbind, reduced.mcmc.model.sim))
+```
+
+
+```{r, message = FALSE, echo=FALSE, results='hide', warning=FALSE}
+## MODELLING
+
+# plot(reduced.mcmc.model.sim, ask=TRUE)
+# gelman.diag(reduced.mcmc.model.sim)
+# autocorr.diag(reduced.mcmc.model.sim)
+# autocorr.plot(reduced.mcmc.model.sim)
+# effectiveSize(reduced.mcmc.model.sim)
+# summary(reduced.mcmc.model.sim)
+# HPDinterval(reduced.mcmc.model.csim)
+# dic2 = dic.samples(reduced.mcmc.model, n.iter=1e3)
+
+# Prediction 
+pm_coef2 = colMeans(reduced.mcmc.model.csim)
+covs.red=c("sexmale", "anginaasymp", "resting_bp", "ser_chol", "oldpeak", "slope.Q", "vessels", "thalreversible", "int")
+names(pm_coef2) <- covs.red
+
+pm_Xb = pm_coef2["int"] + reduced.train.design.matrix %*% pm_coef2[1:8]
+phat = 1.0 / (1.0 + exp(-pm_Xb))
+calc_rocprc(phat, train.y) # ROC & AUC
+roc_lrrtrain <- roc(train.y, phat)
+
+# # Test
+reduced.test.design.matrix=test.design.matrix[,!colnames(test.design.matrix) %in% rm_cov ]
+pm_Xb = pm_coef2["int"] + reduced.test.design.matrix %*% pm_coef2[1:8]
+phat.test.red = 1.0 / (1.0 + exp(-pm_Xb))
+calc_rocprc(phat.test.red, test.y) # ROC & AUC
+roc_lrrtest <- roc(test.y, phat.test.red)
+
+```
+
+Following is the ordered set of parameters w.r.t. their magnitude:
+
+```{r , echo=FALSE}
+## MODELLING
+
+pm_coef2[order(abs(pm_coef2), decreasing = TRUE)]
+```
+
+
+```{r, message = FALSE, echo=FALSE, results='hide', warning=FALSE}
+## MODELLING
+
+# Remove covariates based on the posterior estimates 
+rm_cov = c(  "age", "anginaatypical", "anginanonang", "BSgt120true"
+            ,"restecgstt",  "restecghypertrophy", "max_hr", "slope.L", "thalfixed", "exangyes")
+# FIT Reduced model
+intr.mod.string = " model {
+    for (i in 1:length(y)) {
+        y[i] ~ dbern(p[i])
+        logit(p[i]) = int + b[1]*sexmale[i] 
+                          + b[2]*anginaasymp[i] 
+                          + b[3]*resting_bp[i]       
+                          + b[4]*ser_chol[i]
+                          + b[5]*oldpeak[i]  
+                          + b[6]*slope.Q[i]
+                          + b[7]*vessels[i] 
+                          + b[8]*thalreversible[i]
+                          + b[9]*sexmale[i] * resting_bp[i]
+    }
+    
+    int ~ dnorm(0.0, 1.0/25.0)
+    for (j in 1:9) {
+        b[j] ~ dnorm(0.0, 1.0/25.0) # noninformative for logistic regression
+    }
+} "
+
+params = c("int", "b")
+intr.train.design.matrix=train.design.matrix[,!colnames(train.design.matrix) %in% rm_cov ]
+intr.train.data  = cbind(intr.train.design.matrix , y=train.y)
+intr.train.jags.df <- as.data.frame(intr.train.data)
+# reduced.train.jags.df <- reduced.train.jags.df %>%  
+#                               rename("sexmale_resting_bp"="sexmale:resting_bp") # dplyr
+intr.train.jags.list = as.list(intr.train.jags.df)
+intr.mcmc.model = jags.model(textConnection(intr.mod.string), data=intr.train.jags.list, n.chains=3)
+update(intr.mcmc.model, 1e3)
+intr.mcmc.model.sim = coda.samples(model=intr.mcmc.model,
+                                      variable.names=params,
+                                      n.iter=25e3)
+intr.mcmc.model.csim = as.mcmc(do.call(rbind, intr.mcmc.model.sim))
+```
+
+```{r, message = FALSE, echo=FALSE, results='hide', warning=FALSE}
+## MODELLING
+
+# plot(intr.mcmc.model.sim, ask=TRUE)
+# gelman.diag(intr.mcmc.model.sim)
+# autocorr.diag(intr.mcmc.model.sim)
+# autocorr.plot(intr.mcmc.model.sim)
+# effectiveSize(intr.mcmc.model.sim)
+# summary(intr.mcmc.model.sim)
+# HPDinterval(intr.mcmc.model.csim)
+# dic3 = dic.samples(intr.mcmc.model, n.iter=1e3)
+
+# Prediction 
+pm_coef3 = colMeans(intr.mcmc.model.csim)
+# , "sexmale_anginaasymp"
+covs.intr=c("sexmale", "anginaasymp", "resting_bp", "ser_chol", "oldpeak", "slope.Q", "vessels", "thalreversible", "sexmale_resting_bp", "int")
+names(pm_coef3) <- covs.intr
+
+rdm.train=intr.train.design.matrix
+intr.rdm.train=cbind(rdm.train , rdm.train[,"sexmale"]*rdm.train[,"resting_bp"])
+
+pm_Xb = pm_coef3["int"] + intr.rdm.train %*% pm_coef3[1:9]
+phat = 1.0 / (1.0 + exp(-pm_Xb))
+calc_rocprc(phat, train.y) # ROC & AUC
+roc_lrritrain <- roc(train.y, phat)
+
+# # Test
+rdm.test=test.design.matrix[,!colnames(test.design.matrix) %in% rm_cov ]
+intr.rdm.test=cbind(rdm.test , rdm.test[,"sexmale"]*rdm.test[,"resting_bp"])
+pm_Xb = pm_coef3["int"] + intr.rdm.test %*% pm_coef3[1:9]
+phat = 1.0 / (1.0 + exp(-pm_Xb))
+calc_rocprc(phat, test.y) # ROC & AUC
+roc_lrritest <- roc(test.y, phat)
+```
+
+
+At the fourth step, we experimented with several interaction terms and settled on Sex and "resting_bp" that gave good AUC scores on the test data set. Following is the ordered set of parameters w.r.t. their magnitude. Note that the interaction term has a negative coefficient, meaning that a higher resting blood pressure in females makes them more prone to heart disease: aligned with what we observed in the EDA.
+
+```{r , echo=FALSE}
+## MODELLING
+
+pm_coef3[order(abs(pm_coef3), decreasing = TRUE)]
+```
+
+
+## Results & Conclusion
+
+On analyzing the metrics associated with each model, LR with Laplace prior had the highest AUC on the test data set, but it came at the cost of a complex model with 18 variables. The baseline model performed well on the training set, but it suffered from overfitting (by considering all the 18 variables) as it scored poorly on the test data set. The LR model with the interaction term had a slightly better performance compared to the LR with non-inf. prior; however, the marginal gain with the addition of new interaction term was not significant that could have forced its selection. Thus we decided to select the LR with non-inf by the principle of parsimony.
+
+----------------------------------------------------------------------------------
+Model                 AUC.Train AUC.Test PRC.Train PRC.Test DIC/Penalty #Covariates 
+--------------------- --------- -------- --------- -------- ----------- -----------
+GLM (Baseline)        0.946     0.798    0.940     0.713                18
+
+Logistic Regression   0.945     0.874    0.937     0.807    150.9/14.2  18
+with Laplace Prior
+
+Logistic Regression   0.940     0.856    0.930     0.753    144.7/8.78  8
+with non-informative
+prior
+
+Logistic Regression   0.943     0.860    0.934     0.765    144.5/10.06 9
+with non-inf. prior 
+and interaction
+--------------------------------------------------------------------------------
+Table: Table carrying attributes used to predict presence of CVD.
+
+
+We settled on a probability threshold of 0.25 that gives an overall accuracy of 77.6% at a conservative False-Negative rate of 8.5%. Below confusion matrix provides more details on the same. See the jittered plot in the appendix for more details.
+
+
+Confusion Matrix:
+```{r, echo=FALSE}
+## RESULTS
+
+(tab0.64 = table(phat.test.red > 0.25, Response=test.y))
+```
+
+
+
+Most of the beta coefficients were positive, indicating how a rise in an associated variable can increase CVD's chances. At average values and in the absence of considered factors, being Male carries a probability of 0.2 for having a heart disease. 
+
+Asymptomatic Angina had the highest importance among all other variables. Considering it in Males, at average values of real variables, it can increase CVD chances by a probability of +0.58(0.77) and by +0.26(0.29) in Females. Thus Asymptomatic Angina alone moved the Males deeper into the CVD territory; Layering in Reversible Thalassemia, in addition to Asymptomatic Angina, for Males, it runs the probability to 0.92, for Females it goes up to 0.59. After we add "vessels," with more than one colored vessel, the Female probability reaches to 0.81. 
+
+Thus in Male, at average values, Asymptomatic Angina alone can indicate the presence of CVD with relatively fewer chances of False Positives. And in Females, it'll move them far into CVD zone, if we also observe Reversible Thalassemia and colored vessels. The above is one way of interpreting the variables; there can be several other combinations that can lead to CVD's presence.
+
+In the end, we used our test data as a validation set. A standard approach could have been using CV for model selection and selecting threshold probability. But given the scope of this project work, we didn't include it. For future work, we can use different prior other than the non-informative one, transform variables to see if we can get better results. Also, we could fit sophisticated models like XGBoost (boosted tree-based algorithm) and compare our results.
+
+
+## Appendix
+
+1. Densplot of beta coefficient for the Logistic Regression model without an Interaction term.
+
+```{r, echo=FALSE }
+## RESULTS
+
+# par(mar=c(1,1,1,1))
+colnames(reduced.mcmc.model.csim) <- covs.red
+par(mfrow=c(2,2))
+densplot(reduced.mcmc.model.csim[,1:4], xlim=c(-2,4))
+```
+
+```{r, echo=FALSE}
+## RESULTS
+
+par(mfrow=c(2,2))
+densplot(reduced.mcmc.model.csim[,5:8], xlim=c(-2,4))
+```
+
+2. AUC computed on training and test data from the four models
+
+```{r, echo=FALSE}
+## RESULTS
+
+roc.train <- ggroc(list( bl.train=roc_btrain, lr.train=roc_lrtrain, 
+                         lrr.train=roc_lrtrain, lrri.train=roc_lrritrain)) +
+              xlab("FPR") + ylab("TPR") + 
+              ggtitle("ROC Curve on Training Data Set") +
+              geom_segment(aes(x = 1, xend = 0, y = 0, yend = 1), color="grey", linetype="dashed") +
+              theme(axis.title=element_text(size=8), 
+                    legend.position="bottom", plot.title = element_text(size=8))
+
+roc.test <- ggroc(list( bl.test=roc_btest, lr.test=roc_lrtest, 
+                        lrr.test=roc_lrrtest, lrri.test=roc_lrritest)) +
+              xlab("FPR") + ylab("TPR") + 
+              ggtitle("ROC Curve on Test Data Set") + 
+              geom_segment(aes(x = 1, xend = 0, y = 0, yend = 1), color="grey", linetype="dashed") +
+              theme(axis.title=element_text(size=8), 
+                    legend.position="bottom", plot.title = element_text(size=8))
+
+ggarrange(roc.train, roc.test , ncol = 2, nrow = 1)
+```
+
+3. Response w.r.t. predicted probabilities.
+
+```{r, echo=FALSE}
+plot(phat.test.red, jitter(test.y), xlab="predicted probability", ylab="Jittered Response", main="Distribution of Response Across Predicted Probability")
+```
