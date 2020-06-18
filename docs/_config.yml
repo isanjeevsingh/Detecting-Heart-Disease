@@ -9,5 +9,4 @@ navbar:
    href: heart_disease_report_wcode.html
 output:
   html_document:
- theme: cosmo
-
+  theme: cosmo
