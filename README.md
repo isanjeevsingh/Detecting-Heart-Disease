@@ -9,3 +9,10 @@ Heart diseases or cardiovascular disease (CVD) are widely known, and many people
 In our study, we investigated several factors associated with CVD and narrowed down to critical ones that helped detect the presence of the disease. To eliminate features, we used Bayesian methodology and used Laplace Prior that makes non-essential factor effect to zero. Our final model shows that out of 18 attributes, Sex, High blood pressure in women, asymptomatic chest pain (Angina), and Irreversible Thalassemia were significant predictors of CVD. Being a simpler model with less variable, our generalized model performed better than the baseline model on the test data set with an AUC score of 86%.
 
 Keywords: CVD, Logistic Regression, Bayesian, Laplace Prior, Jags, Variable Selection
+
+## Repository Structure
+
+    ├── README.md          <- The top-level README carrying the project description and organization.
+    ├── docs               <- Folder carrying the pdf report (heart_disease_report.pdf).
+    └── heart_disease      <- Folder carrying the R code written to generate the models, charts, and report.
+    
